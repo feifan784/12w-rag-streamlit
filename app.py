@@ -17,7 +17,7 @@ from langchain_openai import ChatOpenAI
 from langchain_community.embeddings import DashScopeEmbeddings
 # 混合检索 BM25 + 多路融合
 # v1.x 混合检索正确导入
-from langchain_classic.retrievers import EnsembleRetriever
+from langchain.retrievers import EnsembleRetriever
 from langchain_community.retrievers import BM25Retriever
 
 # ===================== 页面基础配置 =====================
