@@ -1,7 +1,8 @@
 import os
-import shutil
 import streamlit as st
 from typing import List
+import chromadb
+
 from dotenv import load_dotenv
 
 # LangChain 核心组件
@@ -15,9 +16,8 @@ from langchain_openai import ChatOpenAI
 
 # 在线通义Embedding
 from langchain_community.embeddings import DashScopeEmbeddings
-# 混合检索 BM25 + 多路融合
-# v1.x 混合检索正确导入
-from langchain.retrievers import EnsembleRetriever
+# 混合检索 BM25 + 多路融合（修复错误导入）
+from langchain_classic.retrievers import EnsembleRetriever
 from langchain_community.retrievers import BM25Retriever
 
 # ===================== 页面基础配置 =====================
@@ -62,9 +62,8 @@ def init_llm():
 
 llm = init_llm()
 
-# ===================== 全局临时存储路径 =====================
+# ===================== 全局临时存储路径（仅存上传PDF，向量全程内存） =====================
 UPLOAD_FOLDER = "./upload_pdf"
-CHROMA_PATH = "./chroma_streamlit_db"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 # ===================== PDF加载与分块 =====================
@@ -79,26 +78,28 @@ def load_pdf_and_split(pdf_file_path):
     chunks = splitter.split_documents(raw_docs)
     return chunks
 
-# ===================== 构建向量库 =====================
+# ===================== 构建向量库（方案2：内存客户端，自动清旧集合） =====================
 def build_vector_store(chunks):
-    if os.path.exists(CHROMA_PATH):
-        shutil.rmtree(CHROMA_PATH)
+    # 强制内存客户端，不读写磁盘
+    client = chromadb.Client()
+    coll_name = "streamlit_rag"
+    # 存在同名集合先删除，避免重复写入rust报错
+    try:
+        client.delete_collection(name=coll_name)
+    except Exception:
+        pass
+    # 新建内存向量库
     db = Chroma.from_documents(
         documents=chunks,
         embedding=embedding,
-        persist_directory=CHROMA_PATH,
-        collection_name="streamlit_rag"
+        collection_name=coll_name,
+        client=client
     )
     return db
 
-# ===================== 混合检索器：向量+BM25 =====================
-def get_hybrid_retriever(all_chunks, top_k=10):
-    db = Chroma(
-        persist_directory=CHROMA_PATH,
-        embedding_function=embedding,
-        collection_name="streamlit_rag"
-    )
-    dense_retriever = db.as_retriever(search_kwargs={"k": top_k})
+# ===================== 混合检索器：复用已构建向量库，不再重复建库 =====================
+def get_hybrid_retriever(vector_db, all_chunks, top_k=10):
+    dense_retriever = vector_db.as_retriever(search_kwargs={"k": top_k})
     bm25_retriever = BM25Retriever.from_documents(all_chunks)
     bm25_retriever.k = top_k
     hybrid_retriever = EnsembleRetriever(
@@ -110,8 +111,12 @@ def get_hybrid_retriever(all_chunks, top_k=10):
 # ===================== Prompt与上下文格式化 =====================
 trace_prompt = PromptTemplate.from_template("""
 你是专业文档问答助手，仅允许使用参考资料内容作答，严禁编造信息。
-回答结束必须单独一段输出【引用来源】，格式：
-[序号] 文档文件名 | 页码 | 原文摘要（100字内）
+请按以下思维链步骤作答：
+
+【分析】分析用户问题的核心意图和关键信息点。
+【检索】从参考资料中定位与问题最相关的内容，列出关键片段。
+【推理】基于检索到的内容，逐步推理得出答案。
+【结论】用简洁清晰的语言给出最终答案。
 
 参考资料：
 {context}
@@ -128,23 +133,23 @@ def format_context(docs):
 with st.sidebar:
     st.header("📤 上传PDF文档")
     uploaded_file = st.file_uploader("选择PDF文件", type=["pdf"])
-    build_flag = False
-    chunk_list = None
 
     if uploaded_file is not None:
         # 保存临时PDF到本地
         temp_pdf_path = os.path.join(UPLOAD_FOLDER, uploaded_file.name)
-        with open(temp_pdf_path, "wb") as f:
-            f.write(uploaded_file.read())
-        st.success(f"已上传：{uploaded_file.name}")
-
-        if st.button("构建知识库向量库"):
+        # 仅在文件未处理过时执行保存与构建
+        if st.session_state.get("last_uploaded_file") != uploaded_file.name:
+            with open(temp_pdf_path, "wb") as f:
+                f.write(uploaded_file.read())
             with st.spinner("正在分块、调用在线Embedding生成向量..."):
                 chunk_list = load_pdf_and_split(temp_pdf_path)
-                build_vector_store(chunk_list)
-                st.success(f"知识库构建完成，总分块：{len(chunk_list)}")
+                vector_db = build_vector_store(chunk_list)
                 st.session_state["chunks"] = chunk_list
-                build_flag = True
+                st.session_state["vector_db"] = vector_db
+                st.session_state["last_uploaded_file"] = uploaded_file.name
+            st.success(f"知识库构建完成，总分块：{len(chunk_list)}")
+        else:
+            st.info(f"知识库已就绪：{uploaded_file.name}（总分块：{len(st.session_state.get('chunks', []))}）")
 
 # ===================== 主页面问答区域 =====================
 st.subheader("💬 文档问答")
@@ -152,35 +157,24 @@ question = st.text_input("输入你的问题：", placeholder="例如：自动�
 submit_btn = st.button("开始问答")
 
 if submit_btn and question:
-    if "chunks" not in st.session_state:
+    # 双重校验缓存：必须同时存在分块和向量库实例
+    if "chunks" not in st.session_state or "vector_db" not in st.session_state:
         st.warning("请先在侧边栏上传PDF并构建知识库！")
     else:
         with st.spinner("混合检索中..."):
-            retriever = get_hybrid_retriever(st.session_state["chunks"], top_k=10)
+            retriever = get_hybrid_retriever(
+                vector_db=st.session_state["vector_db"],
+                all_chunks=st.session_state["chunks"],
+                top_k=10
+            )
             retrieve_docs = retriever.invoke(question)
             context_str = format_context(retrieve_docs)
 
-            # 构建问答链并生成答案
-            rag_chain = (
-                {"context": RunnablePassthrough(), "question": RunnablePassthrough()}
-                | trace_prompt
-                | llm
-                | StrOutputParser()
-            )
-            answer = rag_chain.invoke({"context": context_str, "question": question})
-
-        # 输出AI回答
-        st.markdown("### 🤖 AI回答")
-        st.write(answer)
-
-        # 输出溯源详情
-        st.markdown("### 📑 检索来源溯源详情")
-        for idx, doc in enumerate(retrieve_docs):
-            src = doc.metadata.get("source", "未知")
-            page = doc.metadata.get("page", "无页码")
-            brief = doc.page_content[:120] + "..."
-            st.markdown(f"""
-            **片段{idx+1}**
-            文件：{src} | 页码：{page}
-            摘要：{brief}
-            """)
+            # 流式输出
+            st.markdown("### 🤖 AI回答")
+            answer_placeholder = st.empty()
+            full_answer = ""
+            for chunk in llm.stream(trace_prompt.format(context=context_str, question=question)):
+                full_answer += chunk.content
+                answer_placeholder.markdown(full_answer)
+            st.session_state["last_answer"] = full_answer
