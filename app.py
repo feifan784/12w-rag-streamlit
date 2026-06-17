@@ -108,6 +108,45 @@ def get_hybrid_retriever(vector_db, all_chunks, top_k=10):
     )
     return hybrid_retriever
 
+# ===================== Query 扩展：多路同义改写 =====================
+query_expand_prompt = PromptTemplate.from_template(
+    "你是一个查询改写助手。请将用户的问题改写为3个不同角度的同义问题，"
+    "每行一个，不要编号，不要解释，只要改写后的问题。\n"
+    "用户问题：{question}"
+)
+
+def expand_queries(question: str, llm_instance) -> List[str]:
+    """用 LLM 将单条 query 扩展为多条同义 query（含原始 query）"""
+    prompt_text = query_expand_prompt.format(question=question)
+    response = llm_instance.invoke(prompt_text)
+    expanded = [q.strip() for q in response.content.strip().split("\n") if q.strip()]
+    # 保留原始 query + 扩展 query，去重
+    all_queries = [question] + expanded
+    seen = set()
+    unique = []
+    for q in all_queries:
+        if q not in seen:
+            seen.add(q)
+            unique.append(q)
+    return unique
+
+def multi_query_retrieve(retriever, queries: List[str], top_k: int = 10):
+    """多路检索 + 按内容去重合并"""
+    seen_contents = set()
+    merged_docs = []
+    for q in queries:
+        docs = retriever.invoke(q)
+        for doc in docs:
+            content_key = doc.page_content[:200]
+            if content_key not in seen_contents:
+                seen_contents.add(content_key)
+                merged_docs.append(doc)
+            if len(merged_docs) >= top_k * 2:
+                break
+        if len(merged_docs) >= top_k * 2:
+            break
+    return merged_docs[:top_k * 2]
+
 # ===================== Prompt与上下文格式化 =====================
 trace_prompt = PromptTemplate.from_template("""
 你是专业文档问答助手，仅允许使用参考资料内容作答，严禁编造信息。
@@ -161,16 +200,24 @@ if submit_btn and question:
     if "chunks" not in st.session_state or "vector_db" not in st.session_state:
         st.warning("请先在侧边栏上传PDF并构建知识库！")
     else:
-        with st.spinner("混合检索中..."):
+        with st.spinner("正在扩展查询并混合检索..."):
+            # 1. Query 扩展
+            queries = expand_queries(question, llm)
+            st.markdown("**🔍 查询扩展结果：**")
+            st.write(" → ".join(queries))
+
+            # 2. 构建混合检索器
             retriever = get_hybrid_retriever(
                 vector_db=st.session_state["vector_db"],
                 all_chunks=st.session_state["chunks"],
                 top_k=10
             )
-            retrieve_docs = retriever.invoke(question)
+
+            # 3. 多路检索 + 去重合并
+            retrieve_docs = multi_query_retrieve(retriever, queries, top_k=10)
             context_str = format_context(retrieve_docs)
 
-            # 流式输出
+            # 4. 流式输出
             st.markdown("### 🤖 AI回答")
             answer_placeholder = st.empty()
             full_answer = ""
